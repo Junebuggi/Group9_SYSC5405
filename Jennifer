@@ -1,0 +1,160 @@
+import numpy as np
+import matplotlib.pyplot as plot
+import pandas as pd
+import sklearn
+import glob
+import imblearn
+from sklearn import metrics
+from imblearn.over_sampling import ADASYN 
+from sklearn.feature_selection import RFE
+from sklearn.feature_selection import RFECV
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+
+
+
+
+# Import feature data
+
+Data = pd.read_csv (r'D:\Documents\Grad School\Coursework\BIOM5405\Project\TrainData\Features_All.csv') #place "r" before the path string to address special character, such as '\'. Don't forget to put the file name at the end of the path + '.xlsx'
+
+
+#Test Train Split: 70/30
+Train, Test = sklearn.model_selection.train_test_split(Data, test_size=0.3, train_size=0.7, random_state=None, shuffle=True, stratify=None)
+
+
+# Normalize Training Data
+Train_norm = Train
+Test_norm = Test
+
+Norm = StandardScaler() #Using standard scaler to normalize the data
+Norm.fit(Train_norm.iloc[:,2:1026]) #Fit standard scaler to training data
+Train_norm.iloc[:,2:1026] = Norm.transform(Train_norm.iloc[:,2:1026]) #Transform training data to normalized scalar
+Test_norm.iloc[:,2:1026] = Norm.transform(Test.iloc[:,2:1026]) #Normalize test data
+
+
+
+## Outlier removal function (Waiting on confirmation)
+
+def remove_outliers(arr, k):
+    mu, sigma = np.mean(arr, axis=0), np.std(arr, axis=0, ddof=1)
+    return arr[np.all(np.abs((arr - mu) / sigma) < k, axis=1)]
+def remove_all_outliers(df):
+    df_outliers_rem = pd.DataFrame()
+    for i in range(5):
+        arr = df.loc[df[df.columns[0]]==i].iloc[:,1:df.shape[1]]
+        #.iloc[:, 1:5]
+        arr = remove_outliers(arr, 5).reset_index(drop=True)
+        new_df = pd.DataFrame()
+        new_df["Class"] = np.repeat(i, arr.shape[0])
+        new_df[[str(x) for x in range(arr.shape[1])]] = arr
+        df_outliers_rem = pd.concat([df_outliers_rem, new_df])
+    return df_outliers_rem
+
+
+
+#Balance Classes With ADASYN
+
+X = Train_norm.iloc[:,2:1026]
+y = Train_norm['class']
+
+ada = ADASYN(sampling_strategy='all', random_state=(255), n_neighbors=4)
+
+X_resampled, y_resampled = ada.fit_resample(X, y)
+
+#Check new class counts 
+y_resampled.value_counts()
+
+
+#Fit Initial SVM to Balanced Data
+from sklearn.svm import SVC
+SVM = SVC(C=1, kernel = 'linear', gamma = 1, probability = True)
+SVM.fit(X_resampled,y_resampled)
+SVM_pred = SVM.predict(Test_norm.iloc[:,2:1026])
+
+#Get initial/Baseline F1 Score
+f1_acc_ADASYN = metrics.f1_score(Test_norm['class'], SVM_pred, average = 'macro')
+
+
+
+## Recursive Feature Elimination
+nfeat = 1
+f1_acc_RFE = pd.DataFrame(np.zeros([100, 2]))
+k=0
+
+while (nfeat>0):
+    selector = RFE(estimator = SVM, n_features_to_select= nfeat, step=2)
+    selector = selector.fit(X_resampled, y_resampled)
+    features = selector.support_ #Gives True/False values for each feature
+#Initialize dataframes for features selected by RFE
+    Train_RFE = pd.DataFrame(np.zeros([len(X_resampled.index), np.count_nonzero(features)]))
+    Test_RFE = pd.DataFrame(np.zeros([len(Test), np.count_nonzero(features)]))
+# Reset indexing 
+    Test_ = Test_norm.sort_index(ascending=True)
+    Test_ = Test_.reset_index(drop=True) #need to do this to deal with initial indexing
+
+# Loop: if feature determined important, populate new training and test data using that feature
+    i=0
+    j=0
+    for i in range(len(features)):
+        if (features[i] == True):
+            Train_RFE.iloc [:,j]= X_resampled.iloc[:,i]
+            Test_RFE.iloc [:,j]= Test_.iloc[:,(i+2)]
+            j=j+1
+            i = i+1
+        else:
+            i=i+1        
+#Retrain SVM based only on RFE Features
+    SVM_RFE = SVC(C=1, kernel = 'linear', gamma = 1, probability = True)
+    SVM_RFE.fit(Train_RFE,y_resampled)
+    SVM_RFE_pred = SVM_RFE.predict(Test_RFE)
+#Get F1 Score for SVM with RFE features
+    f1_acc_RFE.iloc[k,0] = metrics.f1_score(Test_['class'], SVM_RFE_pred, average = 'macro')    
+    f1_acc_RFE.iloc[k,1] = nfeat
+    k=k+1
+    nfeat=nfeat-0.01
+
+
+
+
+## RFECV
+
+#Reset counter and initialize dataframe for F1 scores
+nfeat = 1
+f1_acc_RFECV = pd.DataFrame(np.zeros([100, 2]))
+k=0
+
+while (nfeat>0):
+    selector_CV = RFECV(estimator = SVM, min_features_to_select= nfeat, step=2, cv=5)
+    selector_CV = selector_CV.fit(X_resampled, y_resampled)
+    features_CV = selector_CV.support_ #Gives True/False values for each feature
+#Initialize dataframe for new train and test data
+    Train_RFECV = pd.DataFrame(np.zeros([len(X_resampled.index), np.count_nonzero(features_CV)]))
+    Test_RFECV = pd.DataFrame(np.zeros([len(Test), np.count_nonzero(features_CV)]))
+# Reset indexing
+    Test_ = Test_norm.sort_index(ascending=True)
+    Test_ = Test_.reset_index(drop=True) #need to do this to deal with initial indexing
+
+    i=0
+    j=0
+    for i in range(len(features)):
+        if (features_CV[i] == True):
+            Train_RFECV.iloc [:,j]= X_resampled.iloc[:,i]
+            Test_RFECV.iloc [:,j]= Test_.iloc[:,(i+2)]
+            j=j+1
+            i = i+1
+        else:
+            i=i+1        
+#Retrain SVM based only on RFECV Features
+    SVM_RFECV = SVC(C=1, kernel = 'linear', gamma = 1, probability = True)
+    SVM_RFECV.fit(Train_RFECV,y_resampled)
+    SVM_RFECV_pred = SVM_RFECV.predict(Test_RFECV)
+#Get F1 Score for SVM with RFECV features
+    f1_acc_RFECV.iloc[k,0] = metrics.f1_score(Test_['class'], SVM_RFECV_pred, average = 'macro')    
+    f1_acc_RFECV.iloc[k,1] = nfeat
+    k=k+1
+    nfeat=nfeat-0.01
+
+
+
+## Plot F1 scores against Number of Features
